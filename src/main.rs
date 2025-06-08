@@ -36,6 +36,12 @@ pub struct DugOptions {
     pub verbose: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct QueryResult {
+    pub message: trust_dns_proto::op::Message,
+    pub server_used: SocketAddr,
+}
+
 impl Default for DugOptions {
     fn default() -> Self {
         Self {
@@ -71,6 +77,9 @@ async fn main() -> Result<()> {
     
     if options.verbose {
         println!("{}", format!("Query options: {:?}", options).dimmed());
+        if let Some(sys_dns) = get_system_dns_server() {
+            println!("{}", format!("System DNS detected: {}", sys_dns).dimmed());
+        }
     }
 
     let start_time = Instant::now();
@@ -78,8 +87,8 @@ async fn main() -> Result<()> {
     let elapsed = start_time.elapsed();
 
     match result {
-        Ok(response) => {
-            display_response(&response, &options, elapsed)?;
+        Ok(query_result) => {
+            display_response(&query_result, &options, elapsed)?;
         }
         Err(e) => {
             eprintln!("{}: {}", "Error".red().bold(), e);
@@ -321,8 +330,8 @@ fn create_reverse_name(ip: &str) -> Result<String> {
     }
 }
 
-async fn perform_dns_query(options: &DugOptions) -> Result<trust_dns_proto::op::Message> {
-    let resolver = create_resolver(options).await?;
+async fn perform_dns_query(options: &DugOptions) -> Result<QueryResult> {
+    let (resolver, config) = create_resolver(options).await?;
     
     let name = Name::from_str(&options.query_name)?;
     let query_future = resolver.lookup(name, options.query_type);
@@ -349,10 +358,16 @@ async fn perform_dns_query(options: &DugOptions) -> Result<trust_dns_proto::op::
         message.add_answer(record.clone());
     }
     
-    Ok(message)
+    // Get the actual server that was used
+    let server_used = get_server_used(&config, options);
+    
+    Ok(QueryResult {
+        message,
+        server_used,
+    })
 }
 
-async fn create_resolver(options: &DugOptions) -> Result<TokioAsyncResolver> {
+async fn create_resolver(options: &DugOptions) -> Result<(TokioAsyncResolver, ResolverConfig)> {
     let config = if let Some(server) = options.server {
         ResolverConfig::from_parts(
             None,
@@ -360,7 +375,16 @@ async fn create_resolver(options: &DugOptions) -> Result<TokioAsyncResolver> {
             trust_dns_resolver::config::NameServerConfigGroup::from_ips_clear(&[server.ip()], server.port(), true)
         )
     } else {
-        ResolverConfig::default()
+        // Use system DNS server if we can detect it, otherwise default
+        if let Some(system_server) = get_system_dns_server() {
+            ResolverConfig::from_parts(
+                None,
+                vec![],
+                trust_dns_resolver::config::NameServerConfigGroup::from_ips_clear(&[system_server.ip()], system_server.port(), true)
+            )
+        } else {
+            ResolverConfig::default()
+        }
     };
     
     let mut opts = ResolverOpts::default();
@@ -368,27 +392,89 @@ async fn create_resolver(options: &DugOptions) -> Result<TokioAsyncResolver> {
     opts.recursion_desired = options.recurse;
     opts.timeout = options.timeout;
     
-    opts.timeout = options.timeout;
+    let resolver = AsyncResolver::tokio(config.clone(), opts);
+    Ok((resolver, config))
+}
+
+fn get_server_used(config: &ResolverConfig, options: &DugOptions) -> SocketAddr {
+    if let Some(server) = options.server {
+        return server;
+    }
     
-    Ok(AsyncResolver::tokio(config, opts))
+    // Get the first nameserver from the config
+    if let Some(nameserver_config) = config.name_servers().first() {
+        return nameserver_config.socket_addr;
+    }
+    
+    // Fallback to reading system DNS configuration
+    get_system_dns_server().unwrap_or_else(|| SocketAddr::new("127.0.0.1".parse().unwrap(), 53))
+}
+
+fn get_system_dns_server() -> Option<SocketAddr> {
+    // Try macOS scutil first
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("scutil")
+            .arg("--dns")
+            .output() 
+        {
+            if let Ok(content) = String::from_utf8(output.stdout) {
+                for line in content.lines() {
+                    if line.trim().starts_with("nameserver[0]") {
+                        if let Some(ip_str) = line.split(':').nth(1) {
+                            if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
+                                return Some(SocketAddr::new(ip, 53));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Try to read system DNS configuration
+    #[cfg(unix)]
+    {
+        if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
+            for line in content.lines() {
+                if line.trim().starts_with("nameserver") {
+                    if let Some(ip_str) = line.split_whitespace().nth(1) {
+                        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                            return Some(SocketAddr::new(ip, 53));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Windows fallback - try common DNS servers or use a library
+    #[cfg(windows)]
+    {
+        // For Windows, we could use the ipconfig crate or WinAPI
+        // For now, return a common default
+        return Some(SocketAddr::new("127.0.0.1".parse().unwrap(), 53));
+    }
+    
+    None
 }
 
 fn display_response(
-    message: &trust_dns_proto::op::Message,
+    query_result: &QueryResult,
     options: &DugOptions,
     elapsed: Duration,
 ) -> Result<()> {
     if options.json {
-        display_json_response(message, options, elapsed)?;
+        display_json_response(&query_result.message, options, elapsed)?;
         return Ok(());
     }
     
     if options.short {
-        display_short_response(message)?;
+        display_short_response(&query_result.message)?;
         return Ok(());
     }
     
-    display_full_response(message, options, elapsed)?;
+    display_full_response(&query_result.message, options, elapsed, query_result.server_used)?;
     Ok(())
 }
 
@@ -458,6 +544,7 @@ fn display_full_response(
     message: &trust_dns_proto::op::Message,
     options: &DugOptions,
     elapsed: Duration,
+    server_used: SocketAddr,
 ) -> Result<()> {
     let header = message.header();
     
@@ -519,11 +606,7 @@ fn display_full_response(
     // Query Statistics
     if options.show_stats {
         println!();
-        let server_info = if let Some(server) = options.server {
-            format!("{}#{}", server.ip(), server.port())
-        } else {
-            "system resolver".to_string()
-        };
+        let server_info = format!("{}#{}({})", server_used.ip(), server_used.port(), server_used.ip());
         
         println!("{}", format!(";; Query time: {} msec", elapsed.as_millis()).dimmed());
         println!("{}", format!(";; SERVER: {}", server_info).dimmed());
