@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # Enable version updates for Cargo dependencies
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "blackstar257"
+    assignees:
+      - "blackstar257"
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps-dev"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "rust"
+    milestone: null
+    rebase-strategy: "auto"
+    versioning-strategy: "increase"
+    allow:
+      # Allow all dependency types
+      - dependency-type: "direct"
+      - dependency-type: "indirect"
+    ignore:
+      # Ignore major version updates for tokio to avoid breaking changes
+      - dependency-name: "tokio"
+        update-types: ["version-update:semver-major"]
+      # Ignore patch updates for trust-dns-* crates (update monthly instead)
+      - dependency-name: "trust-dns-*"
+        update-types: ["version-update:semver-patch"] 
