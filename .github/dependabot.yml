@@ -19,9 +19,8 @@ updates:
     labels:
       - "dependencies"
       - "rust"
-    milestone: null
     rebase-strategy: "auto"
-    versioning-strategy: "increase"
+    versioning-strategy: "auto"
     allow:
       # Allow all dependency types
       - dependency-type: "direct"
