@@ -105,8 +105,8 @@ fn build_cli() -> Command {
         .about("DNS lookup utility (dig clone)")
         .arg(
             Arg::new("name")
-                .help("Domain name to query")
-                .required(true)
+                .help("Domain name to query (defaults to root servers)")
+                .required(false)
                 .index(1)
         )
         .arg(
@@ -115,7 +115,6 @@ fn build_cli() -> Command {
                 .short('t')
                 .long("type")
                 .value_name("TYPE")
-                .default_value("A")
         )
         .arg(
             Arg::new("class")
@@ -244,7 +243,10 @@ fn build_cli() -> Command {
 fn parse_options(matches: &ArgMatches) -> Result<DugOptions> {
     let mut options = DugOptions::default();
     
-    options.query_name = matches.get_one::<String>("name").unwrap().clone();
+    // Default to root servers query if no name provided
+    options.query_name = matches.get_one::<String>("name")
+        .map(|s| s.clone())
+        .unwrap_or_else(|| ".".to_string());
     
     // Handle server specification
     if let Some(server_str) = matches.get_one::<String>("server") {
@@ -260,8 +262,13 @@ fn parse_options(matches: &ArgMatches) -> Result<DugOptions> {
     
     options.port = matches.get_one::<String>("port").unwrap().parse()?;
     
-    // Parse query type
-    options.query_type = match matches.get_one::<String>("type").unwrap().to_uppercase().as_str() {
+    // Parse query type - default to NS for root queries, A for others
+    let default_type = if options.query_name == "." { "NS" } else { "A" };
+    let query_type_str = matches.get_one::<String>("type")
+        .map(|s| s.as_str())
+        .unwrap_or(default_type);
+    
+    options.query_type = match query_type_str.to_uppercase().as_str() {
         "A" => RecordType::A,
         "AAAA" => RecordType::AAAA,
         "MX" => RecordType::MX,
