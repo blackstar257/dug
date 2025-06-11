@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 trust-dns-resolver = "0.23.2"
 trust-dns-proto = "0.23.2"
-clap = { version = "4.5.39", features = ["derive"] }
+clap = { version = "4.5.40", features = ["derive"] }
 tokio = { version = "1.45.1", features = ["full"] }
 anyhow = "1.0"
 chrono = { version = "0.4.41", features = ["serde"] }
