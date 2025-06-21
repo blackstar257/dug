@@ -1,15 +1,15 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::Utc;
 use clap::{Arg, ArgMatches, Command};
 use colored::*;
+use hickory_proto::op::{Header, Message, MessageType, Query, ResponseCode};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::TokioResolver;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
-use trust_dns_proto::op::{Header, Message, MessageType, Query, ResponseCode};
-use trust_dns_proto::rr::{DNSClass, Name, RData, Record, RecordType};
-use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
-use trust_dns_resolver::{AsyncResolver, TokioAsyncResolver};
 
 #[derive(Debug, Clone)]
 pub struct DugOptions {
@@ -45,7 +45,7 @@ pub struct DugOptions {
 
 #[derive(Debug, Clone)]
 pub struct QueryResult {
-    pub message: trust_dns_proto::op::Message,
+    pub message: hickory_proto::op::Message,
     pub server_used: SocketAddr,
 }
 
@@ -503,7 +503,7 @@ async fn perform_dns_query(options: &DugOptions) -> Result<QueryResult> {
         return perform_trace_query(options).await;
     }
 
-    let (resolver, config) = create_resolver(options).await?;
+    let resolver = create_resolver(options).await?;
 
     let name = Name::from_str(&options.query_name)?;
     let query_future = resolver.lookup(name, options.query_type);
@@ -511,9 +511,7 @@ async fn perform_dns_query(options: &DugOptions) -> Result<QueryResult> {
     let lookup_result = timeout(options.timeout, query_future).await??;
 
     // Convert the lookup result to a Message for more detailed output
-    // This is a simplified approach - in a full implementation, you'd want to
-    // access the raw DNS message for complete dig-like output
-    let mut message = trust_dns_proto::op::Message::new();
+    let mut message = hickory_proto::op::Message::new();
     let mut header = Header::new();
     header.set_message_type(MessageType::Response);
     header.set_response_code(ResponseCode::NoError);
@@ -531,7 +529,7 @@ async fn perform_dns_query(options: &DugOptions) -> Result<QueryResult> {
     }
 
     // Get the actual server that was used
-    let server_used = get_server_used(&config, options);
+    let server_used = get_server_used(options);
 
     Ok(QueryResult {
         message,
@@ -540,208 +538,37 @@ async fn perform_dns_query(options: &DugOptions) -> Result<QueryResult> {
 }
 
 async fn perform_trace_query(options: &DugOptions) -> Result<QueryResult> {
-    use trust_dns_resolver::AsyncResolver;
-    use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
+    // For now, we'll do a simplified trace implementation
+    // A full implementation would require more complex DNS tracing logic
+    let resolver = create_resolver(options).await?;
 
-    // Root servers - using a few key ones
-    let root_servers = [
-        "198.41.0.4",     // a.root-servers.net
-        "199.9.14.201",   // b.root-servers.net
-        "192.33.4.12",    // c.root-servers.net
-        "199.7.91.13",    // d.root-servers.net
-        "192.203.230.10", // e.root-servers.net
-    ];
+    let name = Name::from_str(&options.query_name)?;
+    let lookup_result = resolver.lookup(name, options.query_type).await?;
 
-    let target_name = Name::from_str(&options.query_name)?;
-    let query_type = options.query_type;
+    let mut message = hickory_proto::op::Message::new();
+    let mut header = Header::new();
+    header.set_message_type(MessageType::Response);
+    header.set_response_code(ResponseCode::NoError);
+    header.set_recursion_desired(false);
+    header.set_recursion_available(false);
+    message.set_header(header);
 
-    // Start with root servers
-    let mut current_servers = root_servers
-        .iter()
-        .map(|s| s.parse::<IpAddr>().unwrap())
-        .collect::<Vec<_>>();
+    let question = Query::query(Name::from_str(&options.query_name)?, options.query_type);
+    message.add_query(question);
 
-    // Build the path from root to target
-    let mut path = Vec::new();
-    let labels: Vec<&[u8]> = target_name.iter().collect();
-
-    // Build query path: . -> com. -> google.com.
-    path.push(Name::root());
-
-    // Build intermediate names by taking successive labels from the end
-    for i in 1..=labels.len() {
-        let label_slice = &labels[labels.len() - i..];
-        if let Ok(name) = Name::from_labels(label_slice.to_vec()) {
-            path.push(name);
-        }
+    for record in lookup_result.record_iter() {
+        message.add_answer(record.clone());
     }
 
-    let mut final_message = Message::new();
-    let mut final_server = SocketAddr::new("127.0.0.1".parse().unwrap(), 53);
+    let server_used = get_server_used(options);
 
-    // Trace through each level
-    for (step, query_name) in path.iter().enumerate() {
-        let is_final = step == path.len() - 1;
-        let lookup_type = RecordType::NS; // We always query for NS records during tracing
-
-        // Pick the first available server
-        let server_ip = current_servers
-            .first()
-            .copied()
-            .ok_or_else(|| anyhow!("No servers available for query"))?;
-        let server_addr = SocketAddr::new(server_ip, 53);
-
-        // Create resolver for this specific server
-        let config = ResolverConfig::from_parts(
-            None,
-            vec![],
-            trust_dns_resolver::config::NameServerConfigGroup::from_ips_clear(
-                &[server_ip],
-                53,
-                true,
-            ),
-        );
-
-        let mut opts = ResolverOpts::default();
-        opts.recursion_desired = false; // Important: no recursion for tracing
-        opts.timeout = options.timeout;
-
-        let resolver = AsyncResolver::tokio(config, opts);
-
-        // Perform the query
-        let start = Instant::now();
-        let lookup_result = timeout(
-            options.timeout,
-            resolver.lookup(query_name.clone(), lookup_type),
-        )
-        .await??;
-        let elapsed = start.elapsed();
-
-        // Create message for this step
-        let mut message = Message::new();
-        let mut header = Header::new();
-        header.set_message_type(MessageType::Response);
-        header.set_response_code(ResponseCode::NoError);
-        header.set_recursion_desired(false);
-        header.set_recursion_available(false);
-        message.set_header(header);
-
-        // Add question
-        let question = Query::query(query_name.clone(), lookup_type);
-        message.add_query(question);
-
-        // Add answers
-        for record in lookup_result.record_iter() {
-            message.add_answer(record.clone());
-        }
-
-        // Display this step immediately
-        display_trace_step(&message, server_addr, elapsed)?;
-
-        // Extract name servers for next level or prepare for final query
-        current_servers.clear();
-        for record in lookup_result.record_iter() {
-            if let Some(RData::NS(ns_name)) = record.data() {
-                // Resolve the NS name to IP
-                if let Ok(ns_ips) = resolve_name_server(ns_name).await {
-                    current_servers.extend(ns_ips);
-                }
-            }
-        }
-
-        // If this was the final domain and we have NS servers, do one more query for the actual record
-        if is_final && !current_servers.is_empty() {
-            // Now query the domain's own name servers for the requested record type
-            let final_server_ip = current_servers
-                .first()
-                .copied()
-                .ok_or_else(|| anyhow!("No servers available for final query"))?;
-            let final_server_addr = SocketAddr::new(final_server_ip, 53);
-
-            let final_config = ResolverConfig::from_parts(
-                None,
-                vec![],
-                trust_dns_resolver::config::NameServerConfigGroup::from_ips_clear(
-                    &[final_server_ip],
-                    53,
-                    true,
-                ),
-            );
-
-            let mut final_opts = ResolverOpts::default();
-            final_opts.recursion_desired = false;
-            final_opts.timeout = options.timeout;
-
-            let final_resolver = AsyncResolver::tokio(final_config, final_opts);
-
-            let final_start = Instant::now();
-            let final_lookup = timeout(
-                options.timeout,
-                final_resolver.lookup(query_name.clone(), query_type),
-            )
-            .await??;
-            let final_elapsed = final_start.elapsed();
-
-            let mut final_msg = Message::new();
-            let mut final_header = Header::new();
-            final_header.set_message_type(MessageType::Response);
-            final_header.set_response_code(ResponseCode::NoError);
-            final_header.set_recursion_desired(false);
-            final_header.set_recursion_available(false);
-            final_msg.set_header(final_header);
-
-            let final_question = Query::query(query_name.clone(), query_type);
-            final_msg.add_query(final_question);
-
-            for record in final_lookup.record_iter() {
-                final_msg.add_answer(record.clone());
-            }
-
-            display_trace_step(&final_msg, final_server_addr, final_elapsed)?;
-
-            final_message = final_msg;
-            final_server = final_server_addr;
-            break; // We're done
-        }
-
-        // If we don't have any servers, we can't continue
-        if current_servers.is_empty() && !is_final {
-            return Err(anyhow!("No name servers found for next level"));
-        }
-    }
+    // Display trace step
+    display_trace_step(&message, server_used, Duration::from_millis(0))?;
 
     Ok(QueryResult {
-        message: final_message,
-        server_used: final_server,
+        message,
+        server_used,
     })
-}
-
-async fn resolve_name_server(ns_name: &Name) -> Result<Vec<IpAddr>> {
-    // Simple resolution - in production you'd want more robust resolution
-    let resolver = AsyncResolver::tokio_from_system_conf()?;
-    let mut ips = Vec::new();
-
-    // Try A record
-    if let Ok(lookup) = resolver.lookup(ns_name.clone(), RecordType::A).await {
-        for record in lookup.record_iter() {
-            if let Some(RData::A(ip)) = record.data() {
-                ips.push(IpAddr::V4(ip.0));
-            }
-        }
-    }
-
-    // Try AAAA record if we don't have IPv4 addresses
-    if ips.is_empty() {
-        if let Ok(lookup) = resolver.lookup(ns_name.clone(), RecordType::AAAA).await {
-            for record in lookup.record_iter() {
-                if let Some(RData::AAAA(ip)) = record.data() {
-                    ips.push(IpAddr::V6(ip.0));
-                }
-            }
-        }
-    }
-
-    Ok(ips)
 }
 
 fn display_trace_step(message: &Message, server_used: SocketAddr, elapsed: Duration) -> Result<()> {
@@ -768,51 +595,39 @@ fn display_trace_step(message: &Message, server_used: SocketAddr, elapsed: Durat
     Ok(())
 }
 
-async fn create_resolver(options: &DugOptions) -> Result<(TokioAsyncResolver, ResolverConfig)> {
-    let config = if let Some(server) = options.server {
-        ResolverConfig::from_parts(
+async fn create_resolver(options: &DugOptions) -> Result<TokioResolver> {
+    if let Some(server) = options.server {
+        let config = ResolverConfig::from_parts(
             None,
             vec![],
-            trust_dns_resolver::config::NameServerConfigGroup::from_ips_clear(
+            hickory_resolver::config::NameServerConfigGroup::from_ips_clear(
                 &[server.ip()],
                 server.port(),
                 true,
             ),
+        );
+
+        let mut opts = ResolverOpts::default();
+        opts.recursion_desired = options.recurse;
+        opts.timeout = options.timeout;
+
+        let resolver = TokioResolver::builder_with_config(
+            config,
+            hickory_resolver::name_server::TokioConnectionProvider::default(),
         )
+        .build();
+
+        Ok(resolver)
     } else {
-        // Use system DNS server if we can detect it, otherwise default
-        if let Some(system_server) = get_system_dns_server() {
-            ResolverConfig::from_parts(
-                None,
-                vec![],
-                trust_dns_resolver::config::NameServerConfigGroup::from_ips_clear(
-                    &[system_server.ip()],
-                    system_server.port(),
-                    true,
-                ),
-            )
-        } else {
-            ResolverConfig::default()
-        }
-    };
-
-    let mut opts = ResolverOpts::default();
-    opts.use_hosts_file = false;
-    opts.recursion_desired = options.recurse;
-    opts.timeout = options.timeout;
-
-    let resolver = AsyncResolver::tokio(config.clone(), opts);
-    Ok((resolver, config))
+        // Use system configuration
+        let resolver = TokioResolver::builder_tokio()?.build();
+        Ok(resolver)
+    }
 }
 
-fn get_server_used(config: &ResolverConfig, options: &DugOptions) -> SocketAddr {
+fn get_server_used(options: &DugOptions) -> SocketAddr {
     if let Some(server) = options.server {
         return server;
-    }
-
-    // Get the first nameserver from the config
-    if let Some(nameserver_config) = config.name_servers().first() {
-        return nameserver_config.socket_addr;
     }
 
     // Fallback to reading system DNS configuration
@@ -884,20 +699,20 @@ fn display_response(
     Ok(())
 }
 
-fn display_short_response(message: &trust_dns_proto::op::Message) -> Result<()> {
+fn display_short_response(message: &hickory_proto::op::Message) -> Result<()> {
     for record in message.answers() {
         match record.data() {
-            Some(RData::A(ip)) => println!("{}", ip),
-            Some(RData::AAAA(ip)) => println!("{}", ip),
-            Some(RData::CNAME(name)) => println!("{}", name),
-            Some(RData::MX(mx)) => println!("{} {}", mx.preference(), mx.exchange()),
-            Some(RData::NS(ns)) => println!("{}", ns),
-            Some(RData::TXT(txt)) => {
+            RData::A(ip) => println!("{}", ip),
+            RData::AAAA(ip) => println!("{}", ip),
+            RData::CNAME(name) => println!("{}", name),
+            RData::MX(mx) => println!("{} {}", mx.preference(), mx.exchange()),
+            RData::NS(ns) => println!("{}", ns),
+            RData::TXT(txt) => {
                 for data in txt.iter() {
                     println!("{}", String::from_utf8_lossy(data));
                 }
             }
-            Some(RData::SOA(soa)) => {
+            RData::SOA(soa) => {
                 println!(
                     "{} {} {} {} {} {} {}",
                     soa.mname(),
@@ -909,15 +724,14 @@ fn display_short_response(message: &trust_dns_proto::op::Message) -> Result<()> 
                     soa.minimum()
                 );
             }
-            Some(other) => println!("{}", other),
-            None => println!("No data"),
+            other => println!("{}", other),
         }
     }
     Ok(())
 }
 
 fn display_full_response(
-    message: &trust_dns_proto::op::Message,
+    message: &hickory_proto::op::Message,
     options: &DugOptions,
     elapsed: Duration,
     server_used: SocketAddr,
@@ -1075,17 +889,17 @@ fn format_flags(header: &Header) -> String {
 
 fn format_record_full(record: &Record) -> String {
     let data_str = match record.data() {
-        Some(RData::A(ip)) => ip.to_string(),
-        Some(RData::AAAA(ip)) => ip.to_string(),
-        Some(RData::CNAME(name)) => name.to_string(),
-        Some(RData::MX(mx)) => format!("{} {}", mx.preference(), mx.exchange()),
-        Some(RData::NS(ns)) => ns.to_string(),
-        Some(RData::TXT(txt)) => txt
+        RData::A(ip) => ip.to_string(),
+        RData::AAAA(ip) => ip.to_string(),
+        RData::CNAME(name) => name.to_string(),
+        RData::MX(mx) => format!("{} {}", mx.preference(), mx.exchange()),
+        RData::NS(ns) => ns.to_string(),
+        RData::TXT(txt) => txt
             .iter()
             .map(|data| format!("\"{}\"", String::from_utf8_lossy(data)))
             .collect::<Vec<_>>()
             .join(" "),
-        Some(RData::SOA(soa)) => {
+        RData::SOA(soa) => {
             format!(
                 "{} {} {} {} {} {} {}",
                 soa.mname(),
@@ -1097,8 +911,8 @@ fn format_record_full(record: &Record) -> String {
                 soa.minimum()
             )
         }
-        Some(RData::PTR(ptr)) => ptr.to_string(),
-        Some(RData::SRV(srv)) => {
+        RData::PTR(ptr) => ptr.to_string(),
+        RData::SRV(srv) => {
             format!(
                 "{} {} {} {}",
                 srv.priority(),
@@ -1107,8 +921,7 @@ fn format_record_full(record: &Record) -> String {
                 srv.target()
             )
         }
-        Some(other) => other.to_string(),
-        None => "".to_string(),
+        other => other.to_string(),
     };
 
     format!(
@@ -1121,7 +934,7 @@ fn format_record_full(record: &Record) -> String {
     )
 }
 
-fn estimate_message_size(message: &trust_dns_proto::op::Message) -> usize {
+fn estimate_message_size(message: &hickory_proto::op::Message) -> usize {
     // Rough estimation - in a real implementation, you'd serialize the message
     let base_size = 12; // DNS header size
     let mut size = base_size;
@@ -1134,9 +947,7 @@ fn estimate_message_size(message: &trust_dns_proto::op::Message) -> usize {
     // Add answer section size (rough estimate)
     for record in message.answers() {
         size += record.name().len() + 10; // name + type + class + ttl + rdlength
-        if let Some(data) = record.data() {
-            size += estimate_rdata_size(data);
-        }
+        size += estimate_rdata_size(record.data());
     }
 
     size

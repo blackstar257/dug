@@ -1,11 +1,11 @@
 [package]
 name = "dug"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-trust-dns-resolver = "0.23.2"
-trust-dns-proto = "0.23.2"
+hickory-resolver = "0.25.2"
+hickory-proto = "0.25.2"
 clap = { version = "4.5.40", features = ["derive"] }
 tokio = { version = "1.45.1", features = ["full"] }
 anyhow = "1.0"
