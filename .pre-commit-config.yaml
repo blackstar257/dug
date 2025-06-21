@@ -1,0 +1,32 @@
+repos:
+  # Rust-specific hooks
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      - id: fmt
+        name: Rust formatting (rustfmt)
+        description: Format Rust code with rustfmt
+      - id: cargo-check
+        name: Cargo check
+        description: Check that Rust code compiles
+      - id: clippy
+        name: Clippy
+        description: Lint Rust code with clippy
+        args: ['--all-targets', '--all-features', '--', '-D', 'warnings']
+
+  # General pre-commit hooks for file hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        name: Trim trailing whitespace
+      - id: end-of-file-fixer
+        name: Fix end of files
+      - id: check-yaml
+        name: Check YAML
+      - id: check-toml
+        name: Check TOML
+      - id: check-merge-conflict
+        name: Check for merge conflicts
+      - id: check-added-large-files
+        name: Check for added large files
