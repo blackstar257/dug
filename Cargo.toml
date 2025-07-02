@@ -7,7 +7,7 @@ edition = "2021"
 hickory-resolver = "0.25.2"
 hickory-proto = "0.25.2"
 clap = { version = "4.5.40", features = ["derive"] }
-tokio = { version = "1.45.1", features = ["full"] }
+tokio = { version = "1.46.0", features = ["full"] }
 anyhow = "1.0"
 chrono = { version = "0.4.41", features = ["serde"] }
 colored = "3.0.0"
