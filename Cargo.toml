@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hickory-resolver = "0.25.2"
-hickory-proto = "0.25.2"
+hickory-resolver = "0.26.3"
+hickory-proto = "0.26.3"
 clap = { version = "4.5.54", features = ["derive"] }
 tokio = { version = "1.49.0", features = ["full"] }
 anyhow = "1.0"
